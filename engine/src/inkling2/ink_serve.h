@@ -327,6 +327,7 @@ struct ActiveReq {
     std::vector<int32_t> hist;
     std::vector<int32_t> gen_ids;
     std::vector<int32_t> cached_prefix;  // tokens currently resident in slot KV
+    int ckpt_len = 0;                    // #6627: tokens covered by the slot's prompt checkpoint (0 = none)
     double t_start = 0.0;
     double prompt_ms = 0.0;
     double decode_t0 = 0.0;
@@ -478,12 +479,22 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
             const int lim = std::min(static_cast<int>(rq.cached_prefix.size()), rq.prompt_len - 1);
             while (reuse < lim && rq.cached_prefix[reuse] == rq.prompt_ids[reuse]) ++reuse;
             if (reuse != static_cast<int>(rq.cached_prefix.size())) {
-                reuse = 0;  // Safe reset when SWA/ShortConv state diverged
+                // #6627: the new prompt left the slot's history inside the previous reply (a client never resends
+                // hidden reasoning).  Resume from the end of the previous prompt when it is still a prefix.
+                if (rq.ckpt_len > 0 && reuse >= rq.ckpt_len && backend.restore_checkpoint(rq.slot)) {
+                    reuse = rq.ckpt_len;
+                    rq.cached_prefix.resize(static_cast<size_t>(reuse));
+                    proto("INFO prompt-checkpoint resume %d", reuse);
+                } else {
+                    reuse = 0;  // Safe reset when SWA/ShortConv state diverged
+                }
             }
         }
         if (reuse == 0) {
             backend.reset_slot(rq.slot);
+            backend.drop_checkpoint(rq.slot);
             rq.cached_prefix.clear();
+            rq.ckpt_len = 0;
         } else {
             proto("RESUME %d", reuse);
         }
@@ -538,7 +549,9 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                 std::string cerr;
                 if (s >= 0 && s < P && !reqs[s].active && parse_id_list(line.substr(sp + 1), cids, cerr)) {
                     backend.reset_slot(s);
+                    backend.drop_checkpoint(s);
                     reqs[s].cached_prefix.clear();
+                    reqs[s].ckpt_len = 0;
                     proto("BCOK %d %zu", s, cids.size());
                 }
             }
@@ -806,6 +819,12 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                 rq.prefill_pos += prefill_fed[s];
                 rq.cur_pos = rq.prefill_pos;
                 rq.prompt_ms += step_ms;
+                if (rq.prefill_pos == rq.prompt_len && rq.prompt_img_idx.end() ==
+                        std::find_if(rq.prompt_img_idx.begin(), rq.prompt_img_idx.end(), [](int32_t x) { return x >= 0; })) {
+                    // #6627: the whole prompt is read: checkpoint before any generated token enters the slot
+                    if (backend.checkpoint_slot(s)) rq.ckpt_len = rq.prompt_len;
+                    else rq.ckpt_len = 0;
+                }
                 if (rq.is_solo || !rq.admitted) {
                     const double ppts = step_ms > 0.0 ? (prefill_fed[s] * 1000.0 / step_ms) : 0.0;
                     proto("PP %d %d %.1f %.1f", rq.prefill_pos, rq.prompt_len, rq.prompt_ms, ppts);
