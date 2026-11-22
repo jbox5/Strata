@@ -328,6 +328,7 @@ struct ActiveReq {
     std::vector<int32_t> gen_ids;
     std::vector<int32_t> cached_prefix;  // tokens currently resident in slot KV
     int ckpt_len = 0;                    // #6627: tokens covered by the slot's prompt checkpoint (0 = none)
+    int reused = 0;                      // prompt tokens taken from the slot (RESUME), reported on DONE
     double t_start = 0.0;
     double prompt_ms = 0.0;
     double decode_t0 = 0.0;
@@ -396,7 +397,10 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
     auto finish_req = [&](ActiveReq& rq, const char* reason) {
         const double dec_ms = (rq.decode_t0 > 0.0) ? (now_s() - rq.decode_t0) * 1000.0 : 0.0;
         if (rq.is_solo) {
-            proto("DONE %d %d %.1f %.1f %s", rq.generated, rq.prompt_len, rq.prompt_ms, dec_ms, reason);
+            // Fields 6-8 as the Qwen engines print them (serve/server.py StrataEngine._parse_done): drafts accepted,
+            // drafts offered, prompt tokens reused.  Without them the server reports cached_tokens 0 and no draft_n.
+            proto("DONE %d %d %.1f %.1f %s %d %d %d", rq.generated, rq.prompt_len, rq.prompt_ms, dec_ms, reason,
+                  rq.drafts_accepted, rq.drafts_offered, rq.reused);
         } else if (rq.is_ext_gen) {
             proto("DONE %s %d %d %.1f %.1f %s", rq.req_id.c_str(), rq.generated, rq.prompt_len, rq.prompt_ms, dec_ms, reason);
             req_id_to_slot.erase(rq.req_id);
@@ -498,6 +502,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
         } else {
             proto("RESUME %d", reuse);
         }
+        rq.reused = reuse;
         rq.prefill_pos = reuse;
         rq.cur_pos = reuse;
         rq.hist = rq.prompt_ids;
@@ -881,7 +886,9 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                     const bool cont = !(stop || hit_len || hit_hold || hit_loop);
                     if (!rq.slot_read) proto("T %d", tok);
                     const char* fin = stop ? "stop" : hit_hold ? "hold" : hit_len ? "length" : hit_loop ? "stop" : "admit";
-                    proto("DONE %d %d %.1f 0.0 %s", rq.slot_read ? 0 : 1, rq.prompt_len, rq.prompt_ms, fin);
+                    // Same fields 6-8 as the single-slot DONE; the slot's drafts follow on BDONE (drafts=), which the
+                    // serve adds to these zeros.
+                    proto("DONE %d %d %.1f 0.0 %s 0 0 %d", rq.slot_read ? 0 : 1, rq.prompt_len, rq.prompt_ms, fin, rq.reused);
                     proto("BADM %d %d", rq.slot, cont ? 1 : 0);
                     if (rq.slot_read) proto("BT %d %d", rq.slot, tok);
                     rq.admitted = true;
