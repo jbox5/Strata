@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -268,20 +269,28 @@ inline bool vision_probe(const std::string& path, VisionShardInfo& vi, std::stri
     return true;
 }
 
-// Decode PNG/JPEG/BMP/GIF, composite RGBA onto Inkling2 8x8 checkerboard (204/153), clamp to [40..max_side],
-// pad to multiple of 40 with fill=-1.0 (0..255 scale), normalize (x/255 - 0.5)/0.5, and tile into [grid_h*grid_w, 40, 40, 3].
-inline bool prepare_picture(const std::string& path, const VitCfg& cfg, ImageRec& rec, std::string& err) {
+inline bool read_picture(const std::string& path, std::vector<uint8_t>& buf, std::string& err) {
     FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) {
         err = "cannot open image " + path;
         return false;
     }
-    std::vector<uint8_t> buf;
     uint8_t tmp[65536];
     size_t nr = 0;
     while ((nr = std::fread(tmp, 1, sizeof(tmp), f)) > 0) buf.insert(buf.end(), tmp, tmp + nr);
+    const bool read_ok = !std::ferror(f);
     std::fclose(f);
+    if (!read_ok || buf.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        err = "cannot read image " + path;
+        return false;
+    }
+    return true;
+}
 
+// Decode PNG/JPEG/BMP/GIF, composite RGBA onto Inkling2 8x8 checkerboard (204/153), clamp to [40..max_side],
+// pad to multiple of 40 with fill=-1.0 (0..255 scale), normalize (x/255 - 0.5)/0.5, and tile into [grid_h*grid_w, 40, 40, 3].
+inline bool prepare_picture(const std::string& path, const std::vector<uint8_t>& buf,
+                            const VitCfg& cfg, ImageRec& rec, std::string& err) {
     int w = 0, h = 0, comp = 0;
     uint8_t* rgba = stbi_load_from_memory(buf.data(), static_cast<int>(buf.size()), &w, &h, &comp, 4);
     if (!rgba) {
@@ -394,6 +403,7 @@ inline bool expand_image_pads(
     const std::vector<ImageRec>& recs,
     std::vector<int32_t>& out_ids,
     std::vector<int32_t>& out_img_idx,
+    std::vector<int>& image_positions,
     std::string& err) {
     size_t pads = 0;
     for (int32_t t : ids) pads += (t == image_token);
@@ -410,6 +420,7 @@ inline bool expand_image_pads(
             out_ids.push_back(t);
             out_img_idx.push_back(-1);
         } else {
+            image_positions.push_back(static_cast<int>(out_ids.size()));
             const int n = recs[k].num_lm_tokens();
             for (int i = 0; i < n; ++i) {
                 out_ids.push_back(image_token);
