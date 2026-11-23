@@ -5,6 +5,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -307,6 +308,12 @@ private:
     bool eof_ = false;
 };
 
+struct PromptImage {
+    std::array<uint8_t, 32> digest{};
+    int position = 0;  // first expanded token, in the same coordinate system as cached_prefix
+    int grid_h = 0, grid_w = 0;
+};
+
 struct ActiveReq {
     bool active = false;
     bool is_solo = false;       // GEN vs BGEN / GENERATE
@@ -327,6 +334,7 @@ struct ActiveReq {
     std::vector<int32_t> hist;
     std::vector<int32_t> gen_ids;
     std::vector<int32_t> cached_prefix;  // tokens currently resident in slot KV
+    std::vector<PromptImage> cached_images;  // placeholders alone cannot identify their embeddings
     int ckpt_len = 0;                    // #6627: tokens covered by the slot's prompt checkpoint (0 = none)
     int reused = 0;                      // prompt tokens taken from the slot (RESUME), reported on DONE
     double t_start = 0.0;
@@ -439,33 +447,41 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
         rq.img_embeds.clear();
         rq.prompt_img_idx.clear();
 
+        std::vector<PromptImage> images(pg.images.size());
+        std::vector<ImageRec> recs(pg.images.size());
+        std::vector<std::vector<uint8_t>> picture_bytes(pg.images.size());
         if (!pg.images.empty()) {
             if (!images_ok) {
                 err = "image: engine started without --vision Inkling-2-Mini-Vision.strata";
                 rq.active = false;
                 return false;
             }
-            std::vector<ImageRec> recs;
-            for (const auto& f : pg.images) {
-                ImageRec rc;
-                if (!prepare_picture(f, vprobe.c, rc, err)) { rq.active = false; return false; }
-                recs.push_back(std::move(rc));
+            for (size_t k = 0; k < images.size(); ++k) {
+                if (!read_picture(pg.images[k], picture_bytes[k], err)) { rq.active = false; return false; }
+                Sha256 hash;
+                hash.update(picture_bytes[k].data(), picture_bytes[k].size());
+                images[k].digest = hash.finish();
+                // Files get a new path every HTTP request. Reuse known dimensions by content.
+                const auto known = std::find_if(rq.cached_images.begin(), rq.cached_images.end(),
+                    [&](const PromptImage& old) { return old.digest == images[k].digest; });
+                auto& rec = recs[k];
+                if (known != rq.cached_images.end()) {
+                    rec.grid_h = known->grid_h;
+                    rec.grid_w = known->grid_w;
+                } else if (!prepare_picture(pg.images[k], picture_bytes[k], vprobe.c, rec, err)) {
+                    rq.active = false;
+                    return false;
+                }
+                images[k].grid_h = rec.grid_h;
+                images[k].grid_w = rec.grid_w;
             }
-            if (!expand_image_pads(pg.ids, c.image_token_id, recs, rq.prompt_ids, rq.prompt_img_idx, err)) {
+            std::vector<int> image_positions;
+            if (!expand_image_pads(pg.ids, c.image_token_id, recs, rq.prompt_ids, rq.prompt_img_idx,
+                                   image_positions, err)) {
                 rq.active = false;
                 return false;
             }
-            // Encode images (try GPU backend first, fallback to CPU ViT)
-            for (size_t k = 0; k < recs.size(); ++k) {
-                std::vector<float> emb;
-                std::string verr;
-                if (!backend.encode_image(recs[k], emb, verr)) {
-                    if (!cpu_vit.loaded && !cpu_vit.load(cfg.vision_path, err)) { rq.active = false; return false; }
-                    if (!cpu_vit.encode(recs[k], emb, err)) { rq.active = false; return false; }
-                }
-                rq.img_embeds.insert(rq.img_embeds.end(), emb.begin(), emb.end());
-                proto("IMG %zu %d %d %d", k, recs[k].grid_h, recs[k].grid_w, recs[k].num_lm_tokens());
-            }
+            for (size_t k = 0; k < images.size(); ++k) images[k].position = image_positions[k];
         } else {
             rq.prompt_ids = pg.ids;
             rq.prompt_img_idx.assign(rq.prompt_ids.size(), -1);
@@ -477,11 +493,24 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
             rq.active = false;
             return false;
         }
-        // Prefix reuse check (exact prefix match with no images)
         int reuse = 0;
-        if (pg.images.empty() && !rq.cached_prefix.empty()) {
+        if (!rq.cached_prefix.empty()) {
             const int lim = std::min(static_cast<int>(rq.cached_prefix.size()), rq.prompt_len - 1);
             while (reuse < lim && rq.cached_prefix[reuse] == rq.prompt_ids[reuse]) ++reuse;
+            // Identical image pad tokens may represent different pictures. Stop before the first changed span.
+            size_t k = 0;
+            for (; k < images.size() && k < rq.cached_images.size(); ++k) {
+                const auto& curr = images[k];
+                const auto& prev = rq.cached_images[k];
+                if (curr.position != prev.position || curr.digest != prev.digest ||
+                    curr.grid_h != prev.grid_h || curr.grid_w != prev.grid_w) break;
+                if (reuse < curr.position + curr.grid_h * curr.grid_w) {
+                    reuse = std::min(reuse, curr.position);  // resume only at a whole image boundary
+                    break;
+                }
+            }
+            if (k < images.size()) reuse = std::min(reuse, images[k].position);
+            if (k < rq.cached_images.size()) reuse = std::min(reuse, rq.cached_images[k].position);
             if (reuse != static_cast<int>(rq.cached_prefix.size())) {
                 // #6627: the new prompt left the slot's history inside the previous reply (a client never resends
                 // hidden reasoning).  Resume from the end of the previous prompt when it is still a prefix.
@@ -498,10 +527,34 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
             backend.reset_slot(rq.slot);
             backend.drop_checkpoint(rq.slot);
             rq.cached_prefix.clear();
+            rq.cached_images.clear();
             rq.ckpt_len = 0;
-        } else {
-            proto("RESUME %d", reuse);
         }
+
+        // Only encode pictures with tokens still to be read. Compact the embedding indices for the new suffix.
+        for (size_t k = 0; k < images.size(); ++k) {
+            auto& rec = recs[k];
+            const int start = images[k].position;
+            const int end = start + rec.num_lm_tokens();
+            if (end > reuse) {
+                if (rec.pixel_values.empty() && !prepare_picture(pg.images[k], picture_bytes[k], vprobe.c, rec, err)) {
+                    rq.active = false;
+                    return false;
+                }
+                std::vector<float> emb;
+                std::string verr;
+                if (!backend.encode_image(rec, emb, verr)) {
+                    if (!cpu_vit.loaded && !cpu_vit.load(cfg.vision_path, err)) { rq.active = false; return false; }
+                    if (!cpu_vit.encode(rec, emb, err)) { rq.active = false; return false; }
+                }
+                const int row = static_cast<int>(rq.img_embeds.size() / c.hidden);
+                for (int p = start; p < end; ++p) rq.prompt_img_idx[p] = row + p - start;
+                rq.img_embeds.insert(rq.img_embeds.end(), emb.begin(), emb.end());
+            }
+            proto("IMG %zu %d %d %d", k, rec.grid_h, rec.grid_w, rec.num_lm_tokens());
+        }
+        rq.cached_images = std::move(images);
+        if (reuse > 0) proto("RESUME %d", reuse);
         rq.reused = reuse;
         rq.prefill_pos = reuse;
         rq.cur_pos = reuse;
@@ -556,6 +609,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                     backend.reset_slot(s);
                     backend.drop_checkpoint(s);
                     reqs[s].cached_prefix.clear();
+                    reqs[s].cached_images.clear();
                     reqs[s].ckpt_len = 0;
                     proto("BCOK %d %zu", s, cids.size());
                 }
@@ -824,8 +878,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                 rq.prefill_pos += prefill_fed[s];
                 rq.cur_pos = rq.prefill_pos;
                 rq.prompt_ms += step_ms;
-                if (rq.prefill_pos == rq.prompt_len && rq.prompt_img_idx.end() ==
-                        std::find_if(rq.prompt_img_idx.begin(), rq.prompt_img_idx.end(), [](int32_t x) { return x >= 0; })) {
+                if (rq.prefill_pos == rq.prompt_len) {
                     // #6627: the whole prompt is read: checkpoint before any generated token enters the slot
                     if (backend.checkpoint_slot(s)) rq.ckpt_len = rq.prompt_len;
                     else rq.ckpt_len = 0;

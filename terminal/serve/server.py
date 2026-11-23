@@ -5456,6 +5456,7 @@ class Service:
         # one arrived.  A reasoning-budget continuation is another native generation, not another API request,
         # so the generated reasoning must not become this request's cached input (#615).
         segments = []
+        prompt_total = len(ids)
         timed_out = False
         trace = getattr(self.request_trace, "record", None)
         waiting = time.perf_counter()
@@ -5876,7 +5877,11 @@ class Service:
                             routed = (last.get("lookups") or 0) + (last.get("offloaded") or 0)
                             pcie_share = round(last["offloaded"] / routed, 3) \
                                 if last.get("offloaded") is not None and routed else None
-                            seen = 0 if admission_rejected else prompt_tokens_seen(len(ids), last)   # #471: < len(ids) when cancelled mid-read; #3040
+                            # Inkling expands each image placeholder inside the engine. Use the first
+                            # native segment's length so cached and total tokens use the same units.
+                            if inkling_images and segments:
+                                prompt_total = segments[0].get("prompt_tokens") or prompt_total
+                            seen = 0 if admission_rejected else prompt_tokens_seen(prompt_total, last)   # #471, #3040
                             self.history.append({
                                 "id": request_id,
                                 "projection": (sampling or {}).get("experimental_speed_projection") is not False
@@ -5886,7 +5891,7 @@ class Service:
                                 "prompt_tokens": seen, "reused": last.get("reused"), "output_tokens": n,
                                 "first_engine_token_s": first_engine_token_s,
                                 # the request's whole prompt, and the tokens read of it (None: an older engine)
-                                "prompt_total": len(ids), "prompt_read": last.get("prompt_read"),
+                                "prompt_total": prompt_total, "prompt_read": last.get("prompt_read"),
                                 "reasoning_recoveries": recovery_count,
                                 "reasoning_repeat_coverage": round(repeat_coverage, 3),
                                 "engine_generated": last.get("generated"),
@@ -6010,7 +6015,7 @@ class Service:
             for ev in hold.push([Event("content", stops.flush())]):
                 yield "event", ev
         done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
-                "timings": timings, "reasoning_tokens": thinking_n,
+                "timings": timings, "reasoning_tokens": thinking_n, "prompt_tokens": prompt_total,
                 "reasoning_recoveries": recovery_count}
         if stops is not None and stops.hit is not None:
             done["stop_sequence"] = stops.hit
@@ -6155,7 +6160,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
         except ClientGone:                                      # #1999: the client left while a picture was prepared
             done = {**done, "finish": "cancel"}
             break
-    yield "done", {**done, "completion_tokens": total, "prompt_tokens": len(ids)}
+    yield "done", {**done, "completion_tokens": total, "prompt_tokens": done.get("prompt_tokens", len(ids))}
 
 
 # ------------------------------------------------------------------------------------------------ OpenAI
